@@ -7404,6 +7404,92 @@ fn goose_sessions_index_conversations_but_not_turn_context() {
 }
 
 #[test]
+fn goose_refresh_preserves_unchanged_sessions_and_reconciles_deletions() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("goose");
+    let database = root.join("data/sessions/sessions.db");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
+    crate::sources::goose::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::potion());
+    options.include_goose = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    let session_ids = |session| {
+        let mut ids = SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .records_by_session_id(session)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.doc_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    full();
+    let original = indexed_texts(&paths);
+    let main_ids = session_ids("sess_main");
+    let child_ids = session_ids("sess_child");
+    assert!(!main_ids.is_empty());
+    assert!(!child_ids.is_empty());
+    assert_eq!(full().records_added, 0);
+    assert_eq!(indexed_texts(&paths), original);
+    assert_eq!(session_ids("sess_main"), main_ids);
+    assert_eq!(session_ids("sess_child"), child_ids);
+
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    writer
+        .execute_batch("ALTER TABLE sessions RENAME TO unavailable_sessions")
+        .unwrap();
+    let report = full();
+    assert_eq!(indexed_texts(&paths), original);
+    assert_eq!(
+        report.diagnostics.unreadable_sources,
+        vec![database.to_string_lossy().into_owned()]
+    );
+    writer
+        .execute_batch("ALTER TABLE unavailable_sessions RENAME TO sessions")
+        .unwrap();
+
+    // A narrowed refresh must publish the session deletion, not just drop its checkpoint.
+    writer
+        .execute_batch(
+            "DELETE FROM messages WHERE session_id = 'sess_child';
+             DELETE FROM sessions WHERE id = 'sess_child';",
+        )
+        .unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let dirty = ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([database.clone()]),
+    )
+    .unwrap();
+    assert!(!dirty.full_scan);
+    drop(index);
+    assert!(session_ids("sess_child").is_empty());
+    assert_eq!(session_ids("sess_main"), main_ids);
+
+    // Full discovery must publish deletions too, without resurrecting the child.
+    writer
+        .execute_batch(
+            "DELETE FROM messages WHERE session_id = 'sess_main';
+             DELETE FROM sessions WHERE id = 'sess_main';",
+        )
+        .unwrap();
+    full();
+    assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
 fn goose_store_that_never_existed_is_not_reported_unreadable() {
     let _guard = env_lock();
     let temp = tempfile::tempdir().unwrap();

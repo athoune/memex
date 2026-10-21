@@ -1976,11 +1976,13 @@ pub(super) fn prepare_refresh(
                 state.persisted_file_keys()?,
             )
         };
-        // Bob, ZCode, and KiloCode virtual paths sit "under" a database file, never under a walked directory.
+        // Database-backed virtual paths are reconciled by their source adapters,
+        // never by the transcript directory walk.
         let known = known.into_iter().filter(|key| {
             !crate::sources::bob::matches_path(key)
                 && crate::sources::zcode::split_virtual_path(Path::new(key)).is_none()
                 && crate::sources::kilocode::split_virtual_path(Path::new(key)).is_none()
+                && crate::sources::goose::split_virtual_path(Path::new(key)).is_none()
         });
         Some((
             directories::StampedWalk::new(previous, known.map(PathBuf::from)),
@@ -2219,6 +2221,7 @@ pub(super) fn prepare_refresh(
     opencode_diagnostics.merge(bob_diagnostics);
     opencode_diagnostics.merge(zcode.diagnostics);
     opencode_diagnostics.merge(kilocode.diagnostics);
+    opencode_diagnostics.merge(goose.diagnostics);
     let opencode_scope_targets = opencode.scope_targets;
     let opencode_session_cwds = opencode.session_cwds;
     let opencode_database_states = opencode.database_states;
@@ -2240,6 +2243,11 @@ pub(super) fn prepare_refresh(
             .filter(|root| root.is_dir() && std::fs::read_dir(root).is_ok())
             .collect::<Vec<_>>();
         for path in state.file_keys()? {
+            // Goose virtual paths sit beside sessions.db rather than beneath it.
+            // Their absence on disk says nothing about whether the session exists.
+            if crate::sources::goose::split_virtual_path(Path::new(&path)).is_some() {
+                continue;
+            }
             let confirmed_missing = match Path::new(&path).metadata() {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     let path = Path::new(&path);
@@ -2264,6 +2272,7 @@ pub(super) fn prepare_refresh(
     missing_state_paths.extend(bob_missing_paths);
     missing_state_paths.extend(zcode.missing_paths);
     missing_state_paths.extend(kilocode.missing_paths);
+    missing_state_paths.extend(goose.missing_paths);
 
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).
